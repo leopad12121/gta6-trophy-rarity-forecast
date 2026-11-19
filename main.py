@@ -1,276 +1,216 @@
-"""GTA VI trophy rarity forecaster — make.fun gta6-trophy-rarity-forecast-01.
+#!/usr/bin/env python3
+"""Forecast GTA VI trophy earn rates on Exophase, one week after launch.
 
-Reads every ``<id>.in`` case in the input directory and writes
-``<id>.out`` with one row per trophy::
+Reads every `<id>.in` case in the input directory and writes one
+`<id>.out` forecast per case: for each trophy, five quantiles of its earn
+rate (percent of tracked players) at the case's target, at levels
+0.05 / 0.25 / 0.5 / 0.75 / 0.95.
 
-    {"trophies": [{"id": 1, "q": [q05, q25, q50, q75, q95]}, ...]}
+Model, per trophy, on the logit scale. A launch-week adoption curve
+saturates, so the log-rate is fitted with a saturating exponential
+`y(t) = L + c * exp(-t / tau)` over the case's own history only
+(`t` = hours since the first read; tau on a log-spaced grid of 48 values
+from 0.2 to 40 days; at each tau the (L, c) fit is closed-form least
+squares of y on u = exp(-t / tau); the tau with the least squared error
+wins). The forecast centre is the fitted value at the last read plus
+the fitted move to the target, shrunk toward the cross-trophy mean move
+(weight distinct / (distinct + 2), distinct = number of distinct rates
+the trophy showed) and capped at 2 logit units. The spread widens with
+the horizon and with the size of the move. A trophy whose rate never
+moved (or with fewer than two usable reads) is not fitted at all: it
+reproduces the house persistence baseline exactly.
 
-Each case is the Exophase trophy page for Grand Theft Auto VI on PS5 as
-the house recorded it: each trophy's earn rate (percent of tracked
-players holding it) at every read before the case checkpoint, plus the
-target time a week after launch. The score is mean pinball loss on the
-logit scale.
-
-Method
-------
-Work on the logit scale, ``y = logit(rate)``. Launch-week adoption
-saturates — early trophies are picked up fast, late ones crawl, and the
-tracked base keeps growing with newcomers who hold nothing yet, which
-dilutes every rate — so a line in time or in log time would overshoot a
-week out. Each trophy's logit rate is therefore fitted with a saturating
-curve ``y(t) = L + c * exp(-t / tau)``, using only that case's own
-history. The fit scans tau over 48 log-spaced values from 0.2 to 40
-days; at each tau the (L, c) pair is closed-form least squares of y on
-u = exp(-t / tau), and the tau with the smallest residual sum of squares
-wins. The centre is the fitted value at the last read plus the fitted
-move to the target, shrunk toward the cross-trophy mean move (trophies
-move together; one trophy's noisy fit is not trusted alone) with weight
-distinct / (distinct + 2), where distinct is the number of distinct
-rates the trophy actually showed, and capped at 2 logit units either
-way. A trophy whose rate never moved, or with fewer than two usable
-reads, gets no fit at all: centre = logit(last rate) and spread
-0.5 * sqrt(horizon in days), which reproduces the house persistence
-baseline exactly on flat data.
-
-Spread: ``sigma = sqrt((0.40 * sqrt(days))^2 + (0.20 * |move|)^2)``,
-floored at 0.12 — a little tighter than the house random walk because
-the fitted trend carries real information, widened by how far the
-centre had to extrapolate. Quantiles are centre + z * sigma on the
-logit scale, mapped back to percent and rounded to 4 decimals, half up
-(as JavaScript's Math.round(x * 10000) / 10000 does it; whole numbers
-are written as ints).
-
-Python 3.13, standard library only, no network, no randomness,
-deterministic: the same input bytes give the same output bytes.
+Python 3.13, standard library only. No network, no randomness, no clock:
+the same input bytes always produce the same output bytes.
 """
 
 import json
 import math
 import os
 import sys
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime
 
-# The grader's -P leaves /bot off sys.path: put it back first, so an
-# `import model` finds a model.py shipped beside this file (there is
-# none; this entry is one file, but the line keeps the starter's
-# contract).
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Standard-normal quantiles at the five levels, as the house baseline
+# states them.
+Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
 
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z_VALUES = [-1.645, -0.674, 0.0, 0.674, 1.645]
-
-PERSIST_SIGMA = 0.5     # house baseline spread per sqrt(day)
-FIT_SIGMA = 0.40        # base spread once a trend is fitted
-DRIFT_SIGMA = 0.20      # extra spread per logit unit of extrapolation
-SIGMA_FLOOR = 0.12
-MAX_MOVE = 2.0          # no extrapolated move trusted beyond this
-TAU_MIN_HOURS = 4.8     # 0.2 days
-TAU_MAX_HOURS = 960.0   # 40 days
-TAU_GRID = 48
+# Logit bounds: the rates the page prints are clamped to [0.01, 99.99]
+# percent before taking the logit.
+LOGIT_MIN = math.log(0.0001 / 0.9999)
+LOGIT_MAX = -LOGIT_MIN
 
 
-def clamp_rate(pct):
-    """Keep a percent inside (0, 100) so its logit stays finite."""
-    return min(99.99, max(0.01, pct))
+def logit_pct(rate):
+    """logit of an earn rate given in percent, clamped to [0.01, 99.99]."""
+    r = min(99.99, max(0.01, rate))
+    p = r / 100.0
+    return math.log(p / (1.0 - p))
 
 
-def logit(pct):
-    p = clamp_rate(pct)
-    return math.log(p / (100.0 - p))
-
-
-def inv_logit(y):
-    return 100.0 / (1.0 + math.exp(-y))
+def pct_from_logit(y):
+    """Percent (0..100) for a logit value, overflow-safe."""
+    if y >= 0.0:
+        return 100.0 / (1.0 + math.exp(-y))
+    e = math.exp(y)
+    return 100.0 * e / (1.0 + e)
 
 
 def round4(x):
-    """Round to 4 decimals, half up, as JavaScript's
-    Math.round(x * 10000) / 10000 rounds it. Whole numbers come back
-    as ints, so json writes 100 where JavaScript writes 100."""
-    scaled = x * 10000.0
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    value = whole / 10000.0
-    return int(value) if value.is_integer() else value
+    """Round to 4 decimals, half-up, as Math.round(x * 10000) / 10000.
+
+    Whole numbers come back as ints, so 1.1 stays 1.1, not 1.1000.
+    """
+    r = math.floor(x * 10000.0 + 0.5) / 10000.0
+    if r == int(r):
+        return int(r)
+    return r
 
 
-def parse_time(value):
-    """ISO 8601 string to an aware datetime; None when unparsable."""
-    if not isinstance(value, str):
-        return None
+def parse_time(text):
+    """Parse an ISO 8601 timestamp, or None when it does not parse."""
     try:
-        text = value.strip()
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except ValueError:
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
         return None
 
 
-def least_squares(xs, ys):
-    """Least squares of ys on xs. Returns (intercept, slope, sse) or
-    None when xs has no spread."""
-    n = len(xs)
-    if n < 2:
-        return None
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    sxx = sum((x - mx) ** 2 for x in xs)
-    if sxx <= 0:
-        return None
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    slope = sxy / sxx
-    intercept = my - slope * mx
-    sse = sum((y - (intercept + slope * x)) ** 2 for x, y in zip(xs, ys))
-    return intercept, slope, sse
+def read_times(case):
+    """Hours since the first read for every history read, and the target.
+
+    Falls back to slot order (0, 1, 2, ...) when a timestamp does not
+    parse, so a case with broken clocks still forecasts.
+    """
+    history = case["history"]
+    stamps = [parse_time(read.get("at")) for read in history]
+    target = parse_time(case.get("target"))
+    if any(s is None for s in stamps) or target is None:
+        times = [float(i) for i in range(len(history))]
+        horizon_hours = float(case.get("horizon_minutes", 0)) / 60.0
+        return times, times[-1] + horizon_hours if times else horizon_hours
+    first = stamps[0]
+    times = [(s - first).total_seconds() / 3600.0 for s in stamps]
+    t_target = (target - first).total_seconds() / 3600.0
+    return times, t_target
 
 
-def fit_saturating(ts, ys):
-    """Fit y(t) = L + c * exp(-t / tau) by scanning tau on a log grid;
-    at each tau the (L, c) fit is closed-form least squares of y on
-    u = exp(-t / tau). Returns (L, c, tau_hours) for the tau with the
-    least residual sum of squares, or None when nothing fits."""
+def ols_on_exp(ts, ys, tau_hours):
+    """Least-squares fit of y = L + c * exp(-t / tau); None if degenerate.
+
+    Returns (L, c, sse). Closed form: with u = exp(-t / tau), the slope
+    is Cov(u, y) / Var(u) and the intercept is mean(y) - c * mean(u).
+    """
+    us = [math.exp(-t / tau_hours) for t in ts]
+    n = len(ts)
+    mean_u = sum(us) / n
+    mean_y = sum(ys) / n
+    var_u = sum((u - mean_u) ** 2 for u in us)
+    if var_u <= 0.0:
+        return None
+    cov = sum((u - mean_u) * (y - mean_y) for u, y in zip(us, ys))
+    c = cov / var_u
+    intercept = mean_y - c * mean_u
+    sse = sum((y - (intercept + c * u)) ** 2 for u, y in zip(us, ys))
+    return intercept, c, sse
+
+
+def fit_curve(ts, ys):
+    """Best saturating-exponential fit over the tau grid, or None.
+
+    The grid is 48 tau values log-spaced from 0.2 to 40 days.
+    """
     best = None
-    for k in range(TAU_GRID):
-        tau = TAU_MIN_HOURS * ((TAU_MAX_HOURS / TAU_MIN_HOURS) ** (k / (TAU_GRID - 1)))
-        us = [math.exp(-t / tau) for t in ts]
-        result = least_squares(us, ys)
-        if result is None:
+    for i in range(48):
+        tau_days = 0.2 * (200.0 ** (i / 47.0))
+        got = ols_on_exp(ts, ys, tau_days * 24.0)
+        if got is None:
             continue
-        intercept, slope, sse = result
+        intercept, c, sse = got
         if best is None or sse < best[0]:
-            best = (sse, intercept, slope, tau)
+            best = (sse, intercept, c, tau_days * 24.0)
     if best is None:
         return None
-    _sse, level, c, tau = best
-    return level, c, tau
+    _, intercept, c, tau_hours = best
+    return intercept, c, tau_hours
 
 
-def rate_at(reads, idx):
-    """The trophy's rate at one read, or None when missing/null."""
-    rates = reads.get("rates") or []
-    if idx >= len(rates):
-        return None
-    return rates[idx]
+def forecast_case(case):
+    """Five quantiles per trophy for one case."""
+    history = case["history"]
+    horizon_days = float(case.get("horizon_minutes", 0)) / 1440.0
+    times, t_target = read_times(case)
+    t_last = times[-1] if times else 0.0
+    n_trophies = len(case["trophies"])
 
-
-def forecast_case(case, name):
-    if case["levels"] != LEVELS:
-        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
-    history = case.get("history") or []
-    if not history:
-        raise ValueError(f"{name} has no history")
-    horizon_days = case["horizon_minutes"] / 1440.0
-
-    # Hours since the first read, per read. Fall back to slot order
-    # when a timestamp does not parse.
-    first = parse_time(history[0].get("at")) or parse_time(history[0].get("slot"))
-    times = []
-    for read in history:
-        dt = parse_time(read.get("at")) or parse_time(read.get("slot"))
-        if dt is not None and first is not None:
-            times.append(max(0.0, (dt - first).total_seconds() / 3600.0))
-        else:
-            times.append(float(len(times)))
-    target_dt = parse_time(case.get("target"))
-    if target_dt is not None and first is not None:
-        target_hours = max(times[-1], (target_dt - first).total_seconds() / 3600.0)
-    else:
-        target_hours = times[-1] + case["horizon_minutes"] / 60.0
-
-    trophies = case["trophies"]
-
-    # Per-trophy fit: (fitted logit at last read, raw move to target,
-    # shrinkage weight). A trophy whose rate never moved, or with
-    # fewer than two usable reads, gets no fit and reproduces the
-    # house persistence baseline exactly.
-    fits = []
-    for i in range(len(trophies)):
-        points = []
-        for j, read in enumerate(history):
-            rate = rate_at(read, i)
-            if rate is None:
-                continue
-            points.append((times[j], logit(rate)))
-        if len(points) < 2:
-            fits.append(None)
+    # First pass: fit every trophy that moved, collecting raw moves.
+    moves = []
+    per_trophy = []
+    for index in range(n_trophies):
+        usable = []
+        for read, t in zip(history, times):
+            rates = read.get("rates") or []
+            if index < len(rates) and rates[index] is not None:
+                usable.append((t, float(rates[index])))
+        if len(usable) < 2 or len({rate for _, rate in usable}) < 2:
+            per_trophy.append((None, usable))
             continue
-        distinct = len({round(y, 9) for _, y in points})
-        if distinct < 2:
-            fits.append(None)
+        ts = [t for t, _ in usable]
+        ys = [logit_pct(rate) for _, rate in usable]
+        fitted = fit_curve(ts, ys)
+        if fitted is None:
+            per_trophy.append((None, usable))
             continue
-        ts = [p[0] for p in points]
-        ys = [p[1] for p in points]
-        result = fit_saturating(ts, ys)
-        if result is None:
-            fits.append(None)
-            continue
-        level, c, tau = result
-        anchor = level + c * math.exp(-times[-1] / tau)
-        move = c * (math.exp(-target_hours / tau) - math.exp(-times[-1] / tau))
-        weight = distinct / (distinct + 2.0)
-        fits.append((anchor, move, weight))
+        intercept, c, tau_hours = fitted
+        at_last = intercept + c * math.exp(-t_last / tau_hours)
+        at_target = intercept + c * math.exp(-t_target / tau_hours)
+        move = at_target - at_last
+        moves.append(move)
+        per_trophy.append(((at_last, move, len({rate for _, rate in usable})), usable))
 
-    # Cross-trophy mean move: the shared drift every trophy is shrunk
-    # toward, so one trophy's noisy fit cannot run away on its own.
-    moves = [f[1] for f in fits if f is not None]
     mean_move = sum(moves) / len(moves) if moves else 0.0
 
     rows = []
-    for i, trophy in enumerate(trophies):
-        fit = fits[i]
+    for index, (fit, usable) in enumerate(per_trophy):
         if fit is None:
-            last_rate = None
-            for read in reversed(history):
-                rate = rate_at(read, i)
-                if rate is not None:
-                    last_rate = rate
-                    break
-            centre = logit(last_rate if last_rate is not None else 0)
-            sigma = PERSIST_SIGMA * math.sqrt(horizon_days)
-            move = 0.0
+            # Flat trophy (or too little history): persistence baseline.
+            if usable:
+                centre = logit_pct(usable[-1][1])
+            else:
+                centre = 0.0
+            sigma = 0.5 * math.sqrt(horizon_days)
         else:
-            anchor, raw_move, weight = fit
-            move = weight * raw_move + (1.0 - weight) * mean_move
-            move = max(-MAX_MOVE, min(MAX_MOVE, move))
-            centre = anchor + move
-            centre = max(logit(0.01), min(logit(99.99), centre))
+            at_last, move, distinct = fit
+            weight = distinct / (distinct + 2.0)
+            shrunk = weight * move + (1.0 - weight) * mean_move
+            shrunk = max(-2.0, min(2.0, shrunk))
+            centre = at_last + shrunk
+            centre = max(LOGIT_MIN, min(LOGIT_MAX, centre))
             sigma = math.sqrt(
-                (FIT_SIGMA * math.sqrt(horizon_days)) ** 2
-                + (DRIFT_SIGMA * abs(move)) ** 2
+                (0.40 * math.sqrt(horizon_days)) ** 2
+                + (0.20 * abs(shrunk)) ** 2
             )
-        sigma = max(SIGMA_FLOOR, sigma)
-        qs = []
-        prev = None
-        for z in Z_VALUES:
-            q = round4(inv_logit(centre + z * sigma))
-            q = min(100, max(0, q))
-            if prev is not None and q < prev:
-                q = prev
-            qs.append(q)
-            prev = q
-        rows.append({"id": trophy["id"], "q": qs})
+            sigma = max(sigma, 0.12)
+        quantiles = [round4(pct_from_logit(centre + z * sigma)) for z in Z]
+        rows.append({"id": case["trophies"][index]["id"], "q": quantiles})
     return {"trophies": rows}
 
 
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Every case file, in name order, so two runs write the same bytes.
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case, path.name)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8"
-        )
+    input_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
+    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+    os.makedirs(output_dir, exist_ok=True)
+    for name in sorted(os.listdir(input_dir)):
+        if not name.endswith(".in"):
+            continue
+        with open(os.path.join(input_dir, name), "r", encoding="utf-8") as fh:
+            case = json.load(fh)
+        result = forecast_case(case)
+        # Name the output after the input file, not the case's id: the
+        # grader hands each run one <id>.in file and reads <id>.out.
+        out_path = os.path.join(output_dir, name[:-3] + ".out")
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(result, separators=(",", ":")) + "\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
